@@ -1,0 +1,60 @@
+name: Release Apex Island
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish-tauri:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run frontend typecheck & build
+        run: npm run build
+
+      - name: Run Rust unit tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build & Publish Tauri Windows Installers
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: "Apex Island v__VERSION__"
+          releaseBody: |
+            ### 🏝️ Apex Island v__VERSION__ for Windows
+
+            **Highlights:**
+            - Dynamic Pill & Hardware Notch modes with smooth spring animations
+            - Fullscreen / Maximize **Corner Mini-Notch** (`Top-Left`, `Top-Center`, `Top-Right`) with click-through margins & Auto-Hide option
+            - Windows GSMTC Media Player, System Telemetry, Today (Prayer Times & Weather), Smart OCR, File Shelf, Clipboard History & Focus Timer
+            - Optimized lazy-loaded tab views & adaptive background polling
+
+            > **Note (Windows SmartScreen):** Because this release is not signed with a paid EV certificate, Windows may show *"Windows protected your PC"* on first launch. Click **More info** → **Run anyway**.
+          releaseDraft: false
+          prerelease: false

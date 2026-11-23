@@ -169,12 +169,15 @@ fn handle_client(mut stream: TcpStream, app: AppHandle) {
         let _ = app.emit("agent-permission-request", req_evt);
 
         let guard = pending.decision.lock().unwrap();
-        let (guard, _) = pending
+        let (guard, wait_res) = pending
             .cvar
             .wait_timeout_while(guard, Duration::from_secs(60), |d| d.is_none())
             .unwrap();
         let approved = guard.unwrap_or(false);
         state.pending.lock().unwrap().remove(&req_id);
+        if wait_res.timed_out() || guard.is_none() {
+            let _ = app.emit("agent-permission-expired", &req_id);
+        }
 
         let resp_body = format!(r#"{{"approved":{}}}"#, approved);
         send_json_response(&mut stream, "200 OK", &resp_body);

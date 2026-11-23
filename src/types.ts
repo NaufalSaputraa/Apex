@@ -20,6 +20,11 @@ export interface MediaInfo {
   duration_secs: number;
 }
 
+export interface MediaEventPayload extends Omit<MediaInfo, 'cover_url'> {
+  cover_changed: boolean;
+  cover_url: string | null;
+}
+
 export interface DownloadStatus {
   is_downloading: boolean;
   filename: string;

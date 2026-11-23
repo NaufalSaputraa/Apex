@@ -33,6 +33,7 @@ const SettingsView = lazy(() => import('./components/SettingsView').then((m) => 
 import {
   SystemStats,
   MediaInfo,
+  MediaEventPayload,
   DownloadStatus,
   ShelfFile,
   IslandTab,
@@ -336,13 +337,16 @@ export function App() {
   // Listen for Alt-key Ghost Mode & sync exact pill bounds for transparent click-through
   useEffect(() => {
     if (!(window as any).__TAURI_INTERNALS__) return;
+    let active = true;
     let unlistenGhost: (() => void) | undefined;
     listen<boolean>('island-ghost', (event) => {
-      setIsGhost(Boolean(event.payload));
+      if (active) setIsGhost(Boolean(event.payload));
     }).then((fn) => {
-      unlistenGhost = fn;
+      if (!active) fn();
+      else unlistenGhost = fn;
     });
     return () => {
+      active = false;
       if (unlistenGhost) unlistenGhost();
     };
   }, []);
@@ -395,20 +399,25 @@ export function App() {
   // System Tray event listeners
   useEffect(() => {
     if (!(window as any).__TAURI_INTERNALS__) return;
+    let active = true;
     let unlistenToggle: (() => void) | undefined;
     let unlistenSettings: (() => void) | undefined;
     listen('tray-toggle-expand', () => {
-      setIsExpanded((prev) => !prev);
+      if (active) setIsExpanded((prev) => !prev);
     }).then((fn) => {
-      unlistenToggle = fn;
+      if (!active) fn();
+      else unlistenToggle = fn;
     });
     listen('tray-open-settings', () => {
+      if (!active) return;
       setActiveTab('settings');
       setIsExpanded(true);
     }).then((fn) => {
-      unlistenSettings = fn;
+      if (!active) fn();
+      else unlistenSettings = fn;
     });
     return () => {
+      active = false;
       if (unlistenToggle) unlistenToggle();
       if (unlistenSettings) unlistenSettings();
     };
@@ -457,34 +466,41 @@ export function App() {
 
   useEffect(() => {
     if (!(window as any).__TAURI_INTERNALS__) return;
+    let active = true;
     let u1: (() => void) | undefined;
     let u2: (() => void) | undefined;
     let u3: (() => void) | undefined;
     let u4: (() => void) | undefined;
     let u5: (() => void) | undefined;
+    let u6: (() => void) | undefined;
 
     listen('hotkey-ocr', () => {
-      handleTriggerOcr(false);
+      if (active) handleTriggerOcr(false);
     }).then((fn) => {
-      u1 = fn;
+      if (!active) fn();
+      else u1 = fn;
     });
 
     listen<{ x: number; y: number; width: number; height: number }>('ocr-region-selected', (event) => {
+      if (!active) return;
       const { x, y, width, height } = event.payload;
       setTimeout(() => {
-        runOcrRegion(x, y, width, height);
+        if (active) runOcrRegion(x, y, width, height);
       }, 90);
     }).then((fn) => {
-      u4 = fn;
+      if (!active) fn();
+      else u4 = fn;
     });
 
     listen('ocr-region-cancelled', () => {
-      setOcrLoading(false);
+      if (active) setOcrLoading(false);
     }).then((fn) => {
-      u5 = fn;
+      if (!active) fn();
+      else u5 = fn;
     });
 
     listen<AgentPermissionRequest>('agent-permission-request', (event) => {
+      if (!active) return;
       if (hiddenByFullscreenRef.current && notifyOnFullscreenRef.current) {
         invoke('set_window_visible', { visible: true }).catch(() => {});
       }
@@ -492,10 +508,20 @@ export function App() {
       setActiveTab('agent');
       setIsExpanded(true);
     }).then((fn) => {
-      u2 = fn;
+      if (!active) fn();
+      else u2 = fn;
+    });
+
+    listen<string>('agent-permission-expired', (event) => {
+      if (!active) return;
+      setPendingAgentRequests((prev) => prev.filter((r) => r.id !== event.payload));
+    }).then((fn) => {
+      if (!active) fn();
+      else u6 = fn;
     });
 
     listen<{ agent: string; title: string; message: string }>('agent-notify', (event) => {
+      if (!active) return;
       triggerAlert({
         id: 'agent-' + Date.now(),
         type: 'download',
@@ -504,15 +530,18 @@ export function App() {
         timestamp: Date.now(),
       });
     }).then((fn) => {
-      u3 = fn;
+      if (!active) fn();
+      else u3 = fn;
     });
 
     return () => {
+      active = false;
       if (u1) u1();
       if (u2) u2();
       if (u3) u3();
       if (u4) u4();
       if (u5) u5();
+      if (u6) u6();
     };
   }, []);
 
@@ -540,6 +569,10 @@ export function App() {
             for (const n of list) {
               if (!seenOsNotifIdsRef.current.has(n.id)) {
                 seenOsNotifIdsRef.current.add(n.id);
+                if (seenOsNotifIdsRef.current.size > 200) {
+                  const oldest = seenOsNotifIdsRef.current.values().next().value;
+                  if (oldest !== undefined) seenOsNotifIdsRef.current.delete(oldest);
+                }
                 triggerAlert({
                   id: `os-${n.id}-${Date.now()}`,
                   type: 'download',
@@ -555,7 +588,7 @@ export function App() {
         };
 
         await poll();
-        timer = setInterval(poll, 2500);
+        timer = setInterval(poll, 4000);
       } catch {
         // Unpackaged / unsupported
       }
@@ -602,7 +635,7 @@ export function App() {
       }
     };
 
-    const interval = setInterval(pollClipboard, isMiniNotchMode ? 4500 : 1800);
+    const interval = setInterval(pollClipboard, isMiniNotchMode ? 5000 : 2500);
     return () => clearInterval(interval);
   }, [isMiniNotchMode]);
 
@@ -624,6 +657,10 @@ export function App() {
 
     let unhideStreak = 0;
     let firstCheck = true;
+    const setVisibleIfChanged = async (visible: boolean) => {
+      await invoke('set_window_visible', { visible });
+    };
+
     const checkFullscreen = async () => {
       try {
         const active = await invoke<boolean>('is_fullscreen_app_active');
@@ -632,7 +669,7 @@ export function App() {
         if (fullscreenBehavior === 'mini-notch') {
           if (firstCheck || hiddenByFullscreenRef.current) {
             hiddenByFullscreenRef.current = false;
-            await invoke('set_window_visible', { visible: true });
+            await setVisibleIfChanged(true);
           }
           if (active && !isPinned && !keepVisibleForNotif) {
             unhideStreak = 0;
@@ -663,18 +700,18 @@ export function App() {
             hiddenByFullscreenRef.current = true;
             setIsExpanded(false);
           }
-          await invoke('set_window_visible', { visible: false });
+          await setVisibleIfChanged(false);
         } else if (!active && (hiddenByFullscreenRef.current || firstCheck)) {
           if (firstCheck) {
             unhideStreak = 0;
             hiddenByFullscreenRef.current = false;
-            await invoke('set_window_visible', { visible: true });
+            await setVisibleIfChanged(true);
           } else {
             unhideStreak += 1;
             if (unhideStreak >= 2) {
               unhideStreak = 0;
               hiddenByFullscreenRef.current = false;
-              await invoke('set_window_visible', { visible: true });
+              await setVisibleIfChanged(true);
             }
           }
         } else {
@@ -687,7 +724,7 @@ export function App() {
     };
 
     checkFullscreen();
-    const interval = setInterval(checkFullscreen, 800);
+    const interval = setInterval(checkFullscreen, 1500);
     return () => clearInterval(interval);
   }, [autoHideFullscreen, fullscreenBehavior, isPinned]);
 
@@ -704,35 +741,52 @@ export function App() {
     }
   }, [autoHideFullscreen, activeAlert, pendingAgentRequests.length, isExpanded]);
 
-  // Poll live browser downloads with adaptive interval
+  // Event-driven download status (hydrated once on mount)
   useEffect(() => {
-    const fetchDownload = async () => {
-      try {
-        const res = await invoke<DownloadStatus>('get_download_status');
-        if (prevDownloadDownloadingRef.current && !res.is_downloading && prevDownloadFilenameRef.current) {
-          triggerAlert({
-            id: 'dl-' + Date.now(),
-            type: 'download',
-            title: 'Download Selesai',
-            message: prevDownloadFilenameRef.current,
-            timestamp: Date.now(),
-          });
-        }
-        prevDownloadDownloadingRef.current = res.is_downloading;
-        if (res.filename) {
-          prevDownloadFilenameRef.current = res.filename;
-        }
-        setDownload(res);
-      } catch {
-        // Ignored
-      }
-    };
-    fetchDownload();
-    const interval = setInterval(fetchDownload, isExpanded ? 1000 : isMiniNotchMode ? 8000 : 2500);
-    return () => clearInterval(interval);
-  }, [isExpanded, isMiniNotchMode]);
+    let active = true;
+    let unlisten: (() => void) | undefined;
 
-  // Adaptive clock ticker (1s when expanded, 10s when collapsed, 30s when mini-notch)
+    const applyDownload = (res: DownloadStatus) => {
+      if (!active) return;
+      if (prevDownloadDownloadingRef.current && !res.is_downloading && prevDownloadFilenameRef.current) {
+        triggerAlert({
+          id: 'dl-' + Date.now(),
+          type: 'download',
+          title: 'Download Selesai',
+          message: prevDownloadFilenameRef.current,
+          timestamp: Date.now(),
+        });
+      }
+      prevDownloadDownloadingRef.current = res.is_downloading;
+      if (res.filename) {
+        prevDownloadFilenameRef.current = res.filename;
+      }
+      setDownload(res);
+    };
+
+    invoke<DownloadStatus>('get_download_status')
+      .then(applyDownload)
+      .catch(() => {});
+
+    if ((window as any).__TAURI_INTERNALS__) {
+      listen<DownloadStatus>('download-updated', (event) => {
+        applyDownload(event.payload);
+      }).then((fn) => {
+        if (!active) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
+      });
+    }
+
+    return () => {
+      active = false;
+      if (unlisten) unlisten();
+    };
+  }, []);
+
+  // Adaptive clock ticker (HH:MM only — 5s when expanded, 15s collapsed, 30s mini-notch)
   useEffect(() => {
     const updateClock = () => {
       const now = new Date();
@@ -745,11 +799,13 @@ export function App() {
       );
     };
     updateClock();
-    const interval = setInterval(updateClock, isExpanded ? 1000 : isMiniNotchMode ? 30000 : 10000);
+    const interval = setInterval(updateClock, isExpanded ? 5000 : isMiniNotchMode ? 30000 : 15000);
     return () => clearInterval(interval);
   }, [isExpanded, isMiniNotchMode, settings.clock24h]);
 
-  // Poll system stats with adaptive interval (1.8s expanded, 5s collapsed)
+  // Adaptive system stats polling: active on System tab, slow on laptops (battery alerts), idle on desktops
+  const hasBattery = stats ? stats.has_battery : null;
+  const isSystemTabOpen = isExpanded && activeTab === 'system';
   useEffect(() => {
     const fetchStats = async () => {
       try {
@@ -784,36 +840,80 @@ export function App() {
         }
         prevChargingRef.current = res.is_charging;
         setStats(res);
-      } catch (err) {
-        // Non-Tauri browser preview: do not inject misleading fake system stats
+      } catch {
         setStats(null);
       }
     };
 
-    fetchStats();
-    const interval = setInterval(fetchStats, isExpanded ? 1800 : isMiniNotchMode ? 12000 : 5000);
-    return () => clearInterval(interval);
-  }, [isExpanded, isMiniNotchMode]);
+    if (isSystemTabOpen) {
+      fetchStats();
+      const interval = setInterval(fetchStats, 2000);
+      return () => clearInterval(interval);
+    }
 
-  // Poll GSMTC Media info with adaptive interval
+    if (hasBattery === false) {
+      return;
+    }
+
+    if (hasBattery === null) {
+      fetchStats();
+    }
+    const interval = setInterval(fetchStats, isMiniNotchMode ? 20000 : 10000);
+    return () => clearInterval(interval);
+  }, [isSystemTabOpen, isMiniNotchMode, hasBattery]);
+
+  // Event-driven GSMTC Media info (zero Base64 re-transfer when track unchanged)
   useEffect(() => {
-    const fetchMedia = async () => {
-      try {
-        const res = await invoke<MediaInfo>('get_media_info');
-        setMedia(res);
-      } catch (err) {
-        // If not in Tauri or no media active
-      }
+    let active = true;
+    let unlisten: (() => void) | undefined;
+
+    invoke<MediaInfo>('get_media_info')
+      .then((res) => {
+        if (active) setMedia(res);
+      })
+      .catch(() => {});
+
+    if ((window as any).__TAURI_INTERNALS__) {
+      listen<MediaEventPayload>('media-updated', (event) => {
+        if (!active) return;
+        const p = event.payload;
+        setMedia((prev) => ({
+          is_available: p.is_available,
+          is_playing: p.is_playing,
+          title: p.title,
+          artist: p.artist,
+          album: p.album,
+          source: p.source,
+          cover_url: p.cover_changed ? p.cover_url : prev.cover_url,
+          position_secs: p.position_secs,
+          duration_secs: p.duration_secs,
+        }));
+      }).then((fn) => {
+        if (!active) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
+      });
+    }
+
+    return () => {
+      active = false;
+      if (unlisten) unlisten();
     };
+  }, []);
 
-    fetchMedia();
-    const interval = setInterval(fetchMedia, isExpanded ? 1200 : isMiniNotchMode ? 4500 : 2200);
-    return () => clearInterval(interval);
-  }, [isExpanded, isMiniNotchMode]);
-
-  // Real-time second-by-second playback position advancement when playing
+  // Refresh media timeline once when opening the Media tab
   useEffect(() => {
-    if (!media.is_playing || !media.is_available) return;
+    if (!isExpanded || activeTab !== 'media') return;
+    invoke<MediaInfo>('get_media_info')
+      .then(setMedia)
+      .catch(() => {});
+  }, [isExpanded, activeTab]);
+
+  // Real-time second-by-second playback position advancement ONLY when Media tab is visible
+  useEffect(() => {
+    if (!isExpanded || activeTab !== 'media' || !media.is_playing || !media.is_available) return;
     const interval = setInterval(() => {
       setMedia((prev) => {
         if (!prev.is_playing) return prev;
@@ -825,7 +925,7 @@ export function App() {
       });
     }, 1000);
     return () => clearInterval(interval);
-  }, [media.is_playing, media.is_available]);
+  }, [isExpanded, activeTab, media.is_playing, media.is_available]);
 
   const isPerchedCatMode = !notchMode && companionStyle !== 'minimal' && companionStyle !== 'orb';
   const showPerchedCat = isPerchedCatMode && !isExpanded;
@@ -1001,12 +1101,14 @@ export function App() {
   // Native Tauri v2 Drag & Drop listener for Shelf
   useEffect(() => {
     if (!(window as any).__TAURI_INTERNALS__) return;
+    let active = true;
     let unlistenFn: (() => void) | null = null;
 
     const setupDragDrop = async () => {
       try {
         const webview = getCurrentWebview();
         const unlisten = await webview.onDragDropEvent((event) => {
+          if (!active) return;
           if (event.payload.type === 'enter' || event.payload.type === 'over') {
             setIsDraggingOver(true);
             setIsExpanded(true);
@@ -1038,7 +1140,11 @@ export function App() {
             }
           }
         });
-        unlistenFn = unlisten;
+        if (!active) {
+          unlisten();
+        } else {
+          unlistenFn = unlisten;
+        }
       } catch (err) {
         console.warn('Tauri onDragDropEvent listener error:', err);
       }
@@ -1046,6 +1152,7 @@ export function App() {
 
     setupDragDrop();
     return () => {
+      active = false;
       if (unlistenFn) unlistenFn();
     };
   }, []);
@@ -1193,55 +1300,17 @@ export function App() {
                     gap: '4px',
                   }}
                 >
-                  <motion.span
-                    animate={
-                      media.is_playing
-                        ? { scale: [1, 1.25, 1], opacity: [0.8, 1, 0.8] }
-                        : { scale: [0.92, 1.12, 0.92], opacity: [0.5, 0.95, 0.5] }
-                    }
-                    transition={{
-                      duration: media.is_playing ? 1.4 : 2.6,
-                      repeat: Infinity,
-                      ease: 'easeInOut',
-                    }}
-                    style={{
-                      width: '4px',
-                      height: '4px',
-                      borderRadius: '999px',
-                      background: media.is_playing ? '#10b981' : '#38bdf8',
-                      boxShadow: media.is_playing
-                        ? '0 0 6px rgba(16, 185, 129, 0.9)'
-                        : '0 0 5px rgba(56, 189, 248, 0.8)',
-                    }}
+                  <span
+                    className={`mini-notch-dot ${media.is_playing ? 'is-playing' : ''}`}
                   />
                   {media.is_playing ? (
-                    <span style={{ display: 'flex', alignItems: 'flex-end', gap: '1.5px', height: '8px' }}>
-                      <motion.span
-                        animate={{ height: ['3px', '7px', '4px', '8px', '3px'] }}
-                        transition={{ duration: 0.9, repeat: Infinity, ease: 'easeInOut' }}
-                        style={{ width: '1.5px', borderRadius: '1px', background: '#10b981' }}
-                      />
-                      <motion.span
-                        animate={{ height: ['7px', '3px', '8px', '4px', '7px'] }}
-                        transition={{ duration: 0.75, repeat: Infinity, ease: 'easeInOut' }}
-                        style={{ width: '1.5px', borderRadius: '1px', background: '#34d399' }}
-                      />
-                      <motion.span
-                        animate={{ height: ['4px', '8px', '3px', '6px', '4px'] }}
-                        transition={{ duration: 1.05, repeat: Infinity, ease: 'easeInOut' }}
-                        style={{ width: '1.5px', borderRadius: '1px', background: '#10b981' }}
-                      />
+                    <span className="mini-notch-eq">
+                      <span className="mini-notch-eq-bar" />
+                      <span className="mini-notch-eq-bar" />
+                      <span className="mini-notch-eq-bar" />
                     </span>
                   ) : (
-                    <motion.span
-                      animate={{ opacity: [0.3, 0.65, 0.3], width: ['9px', '12px', '9px'] }}
-                      transition={{ duration: 2.6, repeat: Infinity, ease: 'easeInOut' }}
-                      style={{
-                        height: '2px',
-                        borderRadius: '999px',
-                        background: 'rgba(255, 255, 255, 0.55)',
-                      }}
-                    />
+                    <span className="mini-notch-idle-bar" />
                   )}
                 </motion.div>
               ) : (

@@ -64,15 +64,15 @@ export const PixelPeekingCat: React.FC<PixelPeekingCatProps> = ({
 
       const ox = dx < -12 ? -1 : dx > 12 ? 1 : 0;
       const oy = dy < -10 ? -1 : dy > 14 ? 1 : 0;
-      setCursorOffset({ x: ox, y: oy });
+      setCursorOffset((prev) => (prev.x === ox && prev.y === oy ? prev : { x: ox, y: oy }));
 
       resetTimer = setTimeout(() => {
-        setCursorOffset({ x: 0, y: 0 });
+        setCursorOffset((prev) => (prev.x === 0 && prev.y === 0 ? prev : { x: 0, y: 0 }));
       }, 1200);
     };
 
     const handleMouseLeave = () => {
-      setCursorOffset({ x: 0, y: 0 });
+      setCursorOffset((prev) => (prev.x === 0 && prev.y === 0 ? prev : { x: 0, y: 0 }));
     };
 
     window.addEventListener('mousemove', handleMouseMove, { passive: true });
@@ -259,23 +259,28 @@ export function usePeekingCatMood({
   useEffect(() => {
     if (!enabled || isPlaying || isDownloading || activeAlert || isLoved) return;
 
+    let subTimer: ReturnType<typeof setTimeout> | undefined;
     const interval = setInterval(() => {
+      if (subTimer) clearTimeout(subTimer);
       const rand = Math.random();
       if (rand < 0.5) {
         setIdleMood('idle');
       } else if (rand < 0.78) {
         setIdleMood('blink');
-        setTimeout(() => setIdleMood('idle'), 260);
+        subTimer = setTimeout(() => setIdleMood('idle'), 260);
       } else if (rand < 0.9) {
         setIdleMood('look_left');
-        setTimeout(() => setIdleMood('idle'), 750);
+        subTimer = setTimeout(() => setIdleMood('idle'), 750);
       } else {
         setIdleMood('look_right');
-        setTimeout(() => setIdleMood('idle'), 750);
+        subTimer = setTimeout(() => setIdleMood('idle'), 750);
       }
     }, 3000);
 
-    return () => clearInterval(interval);
+    return () => {
+      clearInterval(interval);
+      if (subTimer) clearTimeout(subTimer);
+    };
   }, [enabled, isPlaying, isDownloading, activeAlert, isLoved]);
 
   const triggerLove = (e?: React.MouseEvent) => {

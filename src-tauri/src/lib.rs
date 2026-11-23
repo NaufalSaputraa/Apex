@@ -64,6 +64,20 @@ pub struct MediaInfo {
 }
 
 #[derive(serde::Serialize, Clone, Debug)]
+pub struct MediaEventPayload {
+    pub is_available: bool,
+    pub is_playing: bool,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub source: String,
+    pub cover_changed: bool,
+    pub cover_url: Option<String>,
+    pub position_secs: f64,
+    pub duration_secs: f64,
+}
+
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
 pub struct DownloadStatus {
     pub is_downloading: bool,
     pub filename: String,
@@ -90,11 +104,23 @@ pub struct ClipboardPollResult {
     pub skipped_private: bool,
 }
 
+#[derive(Default)]
+struct MediaDirtyFlags {
+    session_changed: bool,
+    props_changed: bool,
+    playback_changed: bool,
+    pending_seek: Option<f64>,
+}
+
+type SharedMediaSignal = std::sync::Arc<(Mutex<MediaDirtyFlags>, std::sync::Condvar)>;
+
 struct AppState {
     sys: Mutex<System>,
     last_cpu_refresh: Mutex<std::time::Instant>,
     cached_cpu: Mutex<f32>,
     media: Mutex<MediaInfo>,
+    media_updated_at: Mutex<std::time::Instant>,
+    media_signal: SharedMediaSignal,
     download: Mutex<DownloadStatus>,
     is_expanded: AtomicBool,
     last_clip_seq: AtomicU32,
@@ -109,12 +135,19 @@ fn set_pill_bounds(
     right: i32,
     bottom: i32,
 ) {
-    *state.pill_bounds.lock().unwrap() = (left, top, right, bottom);
+    *state.pill_bounds.lock().unwrap_or_else(|e| e.into_inner()) = (left, top, right, bottom);
 }
 
 #[tauri::command]
 fn set_island_expanded(state: tauri::State<'_, AppState>, expanded: bool) {
     state.is_expanded.store(expanded, Ordering::Relaxed);
+    if expanded {
+        let (lock, cvar) = &*state.media_signal;
+        if let Ok(mut flags) = lock.lock() {
+            flags.playback_changed = true;
+            cvar.notify_one();
+        }
+    }
 }
 
 #[tauri::command]
@@ -126,14 +159,14 @@ fn trim_working_set() {
 
 #[tauri::command]
 fn get_system_stats(state: tauri::State<'_, AppState>) -> SystemStats {
-    let mut cpu_usage = *state.cached_cpu.lock().unwrap();
+    let mut cpu_usage = *state.cached_cpu.lock().unwrap_or_else(|e| e.into_inner());
     {
-        let mut last = state.last_cpu_refresh.lock().unwrap();
+        let mut last = state.last_cpu_refresh.lock().unwrap_or_else(|e| e.into_inner());
         if last.elapsed() >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL {
-            let mut sys = state.sys.lock().unwrap();
+            let mut sys = state.sys.lock().unwrap_or_else(|e| e.into_inner());
             sys.refresh_cpu_usage();
             cpu_usage = sys.global_cpu_usage();
-            *state.cached_cpu.lock().unwrap() = cpu_usage;
+            *state.cached_cpu.lock().unwrap_or_else(|e| e.into_inner()) = cpu_usage;
             *last = std::time::Instant::now();
         }
     }
@@ -206,14 +239,53 @@ fn send_media_key(key: String) -> Result<(), String> {
     Ok(())
 }
 
+fn extrapolate_media_position(info: &mut MediaInfo, elapsed_secs: f64) {
+    if info.is_available && info.is_playing && elapsed_secs > 0.0 {
+        let next = info.position_secs + elapsed_secs;
+        info.position_secs = if info.duration_secs > 0.0 {
+            next.min(info.duration_secs)
+        } else {
+            next
+        };
+    }
+}
+
 #[tauri::command]
 fn get_media_info(state: tauri::State<'_, AppState>) -> MediaInfo {
-    state.media.lock().unwrap().clone()
+    let mut info = state.media.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let elapsed = state
+        .media_updated_at
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .elapsed()
+        .as_secs_f64();
+    extrapolate_media_position(&mut info, elapsed);
+    info
 }
 
 #[tauri::command]
 fn get_download_status(state: tauri::State<'_, AppState>) -> DownloadStatus {
-    state.download.lock().unwrap().clone()
+    state.download.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+struct ComMtaGuard(bool);
+
+impl ComMtaGuard {
+    fn init() -> Self {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        Self(hr.is_ok())
+    }
+}
+
+impl Drop for ComMtaGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe {
+                windows::Win32::System::Com::CoUninitialize();
+            }
+        }
+    }
 }
 
 async fn extract_thumbnail_base64(
@@ -222,141 +294,342 @@ async fn extract_thumbnail_base64(
     use base64::Engine;
     use windows::Storage::Streams::DataReader;
 
+    const MAX_THUMB_BYTES: usize = 2_000_000;
+
     let thumb_ref = media_props.Thumbnail().ok()?;
     let stream = thumb_ref.OpenReadAsync().ok()?.await.ok()?;
-    let size = stream.Size().ok()? as usize;
-    if size == 0 || size > 5_000_000 {
+    let size = stream.Size().ok().unwrap_or(0) as usize;
+    if size == 0 || size > MAX_THUMB_BYTES {
+        let _ = stream.Close();
         return None;
     }
 
-    let reader = DataReader::CreateDataReader(&stream).ok()?;
-    reader.LoadAsync(size as u32).ok()?.await.ok()?;
-    let mut buffer = vec![0u8; size];
-    reader.ReadBytes(&mut buffer).ok()?;
-
-    let encoded = base64::engine::general_purpose::STANDARD.encode(&buffer);
-    Some(format!("data:image/jpeg;base64,{}", encoded))
-}
-
-async fn get_gsmtc_media() -> windows::core::Result<MediaInfo> {
-    use windows::Media::Control::{
-        GlobalSystemMediaTransportControlsSessionManager,
-        GlobalSystemMediaTransportControlsSessionPlaybackStatus,
+    let reader = match DataReader::CreateDataReader(&stream) {
+        Ok(r) => r,
+        Err(_) => {
+            let _ = stream.Close();
+            return None;
+        }
     };
 
-    let session_manager =
-        GlobalSystemMediaTransportControlsSessionManager::RequestAsync()?.await?;
-    if let Ok(current_session) = session_manager.GetCurrentSession() {
-        let source = current_session.SourceAppUserModelId()?.to_string();
-        let playback_info = current_session.GetPlaybackInfo()?;
-        let status = playback_info.PlaybackStatus()?;
-        let is_playing =
-            status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
+    let load_res = match reader.LoadAsync(size as u32) {
+        Ok(op) => op.await,
+        Err(e) => Err(e),
+    };
 
-        let media_props = current_session.TryGetMediaPropertiesAsync()?.await?;
-        let title = media_props.Title()?.to_string();
-        let artist = media_props.Artist()?.to_string();
-        let album = media_props.AlbumTitle()?.to_string();
-        let cover_url = extract_thumbnail_base64(&media_props).await;
-
-        let (position_secs, duration_secs) = if let Ok(timeline) = current_session.GetTimelineProperties() {
-            let mut pos = timeline.Position().map(|p| p.Duration as f64 / 10_000_000.0).unwrap_or(0.0);
-            let end = timeline.EndTime().map(|e| e.Duration as f64 / 10_000_000.0).unwrap_or(0.0);
-
-            if is_playing {
-                if let Ok(last_updated) = timeline.LastUpdatedTime() {
-                    let unix_now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default();
-                    let now_100ns = (unix_now.as_secs() + 11_644_473_600) as i64 * 10_000_000
-                        + (unix_now.subsec_nanos() / 100) as i64;
-                    let elapsed_ticks = now_100ns - last_updated.UniversalTime;
-                    if elapsed_ticks > 0 && elapsed_ticks < 864_000_000_000 {
-                        let elapsed_secs = elapsed_ticks as f64 / 10_000_000.0;
-                        pos = (pos + elapsed_secs).min(if end > 0.0 { end } else { f64::MAX });
-                    }
-                }
-            }
-
-            (pos, end)
+    let encoded = if load_res.is_ok() {
+        let mut buffer = vec![0u8; size];
+        if reader.ReadBytes(&mut buffer).is_ok() {
+            Some(format!(
+                "data:image/jpeg;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(&buffer)
+            ))
         } else {
-            (0.0, 0.0)
+            None
+        }
+    } else {
+        None
+    };
+
+    let _ = reader.DetachStream();
+    let _ = reader.Close();
+    let _ = stream.Close();
+    encoded
+}
+
+struct SubscribedSession {
+    session: windows::Media::Control::GlobalSystemMediaTransportControlsSession,
+    media_props_token: i64,
+    playback_token: i64,
+    timeline_token: i64,
+}
+
+impl SubscribedSession {
+    fn subscribe(
+        session: windows::Media::Control::GlobalSystemMediaTransportControlsSession,
+        signal: &SharedMediaSignal,
+    ) -> Self {
+        use windows::Foundation::TypedEventHandler;
+        use windows::Media::Control::{
+            GlobalSystemMediaTransportControlsSession, MediaPropertiesChangedEventArgs,
+            PlaybackInfoChangedEventArgs, TimelinePropertiesChangedEventArgs,
         };
 
-        return Ok(MediaInfo {
-            is_available: !title.is_empty(),
-            is_playing,
-            title,
-            artist,
-            album,
-            source,
-            cover_url,
-            position_secs,
-            duration_secs,
-        });
+        let s1 = signal.clone();
+        let media_props_token = session
+            .MediaPropertiesChanged(&TypedEventHandler::<
+                GlobalSystemMediaTransportControlsSession,
+                MediaPropertiesChangedEventArgs,
+            >::new(move |_, _| {
+                let (lock, cvar) = &*s1;
+                if let Ok(mut flags) = lock.lock() {
+                    flags.props_changed = true;
+                    cvar.notify_one();
+                }
+                Ok(())
+            }))
+            .unwrap_or(0);
+
+        let s2 = signal.clone();
+        let playback_token = session
+            .PlaybackInfoChanged(&TypedEventHandler::<
+                GlobalSystemMediaTransportControlsSession,
+                PlaybackInfoChangedEventArgs,
+            >::new(move |_, _| {
+                let (lock, cvar) = &*s2;
+                if let Ok(mut flags) = lock.lock() {
+                    flags.playback_changed = true;
+                    cvar.notify_one();
+                }
+                Ok(())
+            }))
+            .unwrap_or(0);
+
+        let s3 = signal.clone();
+        let timeline_token = session
+            .TimelinePropertiesChanged(&TypedEventHandler::<
+                GlobalSystemMediaTransportControlsSession,
+                TimelinePropertiesChangedEventArgs,
+            >::new(move |_, _| {
+                let (lock, cvar) = &*s3;
+                if let Ok(mut flags) = lock.lock() {
+                    flags.playback_changed = true;
+                    cvar.notify_one();
+                }
+                Ok(())
+            }))
+            .unwrap_or(0);
+
+        Self {
+            session,
+            media_props_token,
+            playback_token,
+            timeline_token,
+        }
     }
 
-    Ok(MediaInfo {
+    fn unsubscribe(&self) {
+        if self.media_props_token != 0 {
+            let _ = self
+                .session
+                .RemoveMediaPropertiesChanged(self.media_props_token);
+        }
+        if self.playback_token != 0 {
+            let _ = self.session.RemovePlaybackInfoChanged(self.playback_token);
+        }
+        if self.timeline_token != 0 {
+            let _ = self
+                .session
+                .RemoveTimelinePropertiesChanged(self.timeline_token);
+        }
+    }
+}
+
+impl Drop for SubscribedSession {
+    fn drop(&mut self) {
+        self.unsubscribe();
+    }
+}
+
+#[derive(Default, PartialEq, Eq)]
+struct TrackKey {
+    source: String,
+    title: String,
+    artist: String,
+    album: String,
+}
+
+struct MediaCache {
+    track_key: Option<TrackKey>,
+    cover_url: Option<String>,
+    last_emitted: MediaInfo,
+    last_emitted_at: std::time::Instant,
+    last_fallback_check: std::time::Instant,
+}
+
+impl MediaCache {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            track_key: None,
+            cover_url: None,
+            last_emitted: empty_media_info(),
+            last_emitted_at: now,
+            last_fallback_check: now,
+        }
+    }
+}
+
+fn empty_media_info() -> MediaInfo {
+    MediaInfo {
         is_available: false,
         is_playing: false,
-        title: "".into(),
-        artist: "".into(),
-        album: "".into(),
-        source: "".into(),
+        title: String::new(),
+        artist: String::new(),
+        album: String::new(),
+        source: String::new(),
         cover_url: None,
         position_secs: 0.0,
         duration_secs: 0.0,
-    })
+    }
 }
 
-fn scan_downloads_folder(last_size: &mut u64) -> DownloadStatus {
-    let mut status = DownloadStatus {
-        is_downloading: false,
-        filename: "".into(),
-        bytes_downloaded: 0,
-        speed_formatted: "".into(),
-        percent: 0.0,
-        is_completed: false,
-    };
+fn is_rpc_disconnected(err: &windows::core::Error) -> bool {
+    let code = err.code().0 as u32;
+    code == 0x800706BA || code == 0x80010108
+}
 
-    let downloads_dir = match std::env::var("USERPROFILE") {
-        Ok(profile) => std::path::PathBuf::from(profile).join("Downloads"),
-        Err(_) => return status,
-    };
+fn should_emit_media_update(prev: &MediaInfo, next: &MediaInfo, elapsed_secs: f64) -> bool {
+    if prev.is_available != next.is_available
+        || prev.is_playing != next.is_playing
+        || prev.title != next.title
+        || prev.artist != next.artist
+        || prev.album != next.album
+        || prev.source != next.source
+        || (prev.duration_secs - next.duration_secs).abs() > 0.5
+    {
+        return true;
+    }
 
-    if let Ok(entries) = std::fs::read_dir(downloads_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(ext) = path.extension() {
-                let ext_str = ext.to_string_lossy();
-                if ext_str == "crdownload" || ext_str == "part" || ext_str == "download" {
-                    if let Ok(meta) = entry.metadata() {
-                        let cur_len = meta.len();
-                        let delta = cur_len.saturating_sub(*last_size);
-                        *last_size = cur_len;
+    if next.is_playing {
+        let expected = prev.position_secs + elapsed_secs.max(0.0);
+        (next.position_secs - expected).abs() > 2.5
+    } else {
+        (next.position_secs - prev.position_secs).abs() > 1.0
+    }
+}
 
-                        let speed_mb = (delta as f64) / (1024.0 * 1024.0);
-                        let file_stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+fn read_timeline(
+    session: &windows::Media::Control::GlobalSystemMediaTransportControlsSession,
+    is_playing: bool,
+) -> (f64, f64) {
+    if let Ok(timeline) = session.GetTimelineProperties() {
+        let mut pos = timeline
+            .Position()
+            .map(|p| p.Duration as f64 / 10_000_000.0)
+            .unwrap_or(0.0);
+        let end = timeline
+            .EndTime()
+            .map(|e| e.Duration as f64 / 10_000_000.0)
+            .unwrap_or(0.0);
 
-                        status.is_downloading = true;
-                        status.filename = file_stem;
-                        status.bytes_downloaded = cur_len;
-                        status.speed_formatted = if speed_mb >= 0.1 {
-                            format!("{:.1} MB/s", speed_mb)
-                        } else {
-                            let speed_kb = (delta as f64) / 1024.0;
-                            format!("{:.0} KB/s", speed_kb)
-                        };
-                        status.percent = ((cur_len % (50 * 1024 * 1024)) as f32 / (50.0 * 1024.0 * 1024.0) * 100.0).clamp(10.0, 95.0);
-                        return status;
+        if is_playing {
+            if let Ok(last_updated) = timeline.LastUpdatedTime() {
+                let unix_now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let now_100ns = (unix_now.as_secs() + 11_644_473_600) as i64 * 10_000_000
+                    + (unix_now.subsec_nanos() / 100) as i64;
+                let elapsed_ticks = now_100ns - last_updated.UniversalTime;
+                if elapsed_ticks > 0 && elapsed_ticks < 864_000_000_000 {
+                    let elapsed_secs = elapsed_ticks as f64 / 10_000_000.0;
+                    pos = (pos + elapsed_secs).min(if end > 0.0 { end } else { f64::MAX });
+                }
+            }
+        }
+        (pos, end)
+    } else {
+        (0.0, 0.0)
+    }
+}
+
+struct DownloadsScanner {
+    downloads_dir: Option<std::path::PathBuf>,
+    last_dir_mtime: Option<std::time::SystemTime>,
+    last_size: u64,
+    active_download: bool,
+    last_emitted: DownloadStatus,
+}
+
+impl DownloadsScanner {
+    fn new(downloads_dir: Option<std::path::PathBuf>) -> Self {
+        Self {
+            downloads_dir,
+            last_dir_mtime: None,
+            last_size: 0,
+            active_download: false,
+            last_emitted: DownloadStatus {
+                is_downloading: false,
+                filename: String::new(),
+                bytes_downloaded: 0,
+                speed_formatted: String::new(),
+                percent: 0.0,
+                is_completed: false,
+            },
+        }
+    }
+
+    fn scan_if_needed(&mut self) -> (bool, DownloadStatus) {
+        let Some(ref dir) = self.downloads_dir else {
+            return (false, self.last_emitted.clone());
+        };
+
+        let cur_mtime = std::fs::metadata(dir).and_then(|m| m.modified()).ok();
+        if !self.active_download && cur_mtime.is_some() && cur_mtime == self.last_dir_mtime {
+            return (false, self.last_emitted.clone());
+        }
+        self.last_dir_mtime = cur_mtime;
+
+        let mut status = DownloadStatus {
+            is_downloading: false,
+            filename: String::new(),
+            bytes_downloaded: 0,
+            speed_formatted: String::new(),
+            percent: 0.0,
+            is_completed: false,
+        };
+
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(ext) = path.extension() {
+                    let ext_str = ext.to_string_lossy();
+                    if ext_str == "crdownload" || ext_str == "part" || ext_str == "download" {
+                        if let Ok(meta) = entry.metadata() {
+                            let cur_len = meta.len();
+                            let delta = cur_len.saturating_sub(self.last_size);
+                            self.last_size = cur_len;
+
+                            let speed_mb = (delta as f64) / (1024.0 * 1024.0);
+                            let file_stem = path
+                                .file_stem()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string();
+
+                            status.is_downloading = true;
+                            status.filename = file_stem;
+                            status.bytes_downloaded = cur_len;
+                            status.speed_formatted = if speed_mb >= 0.1 {
+                                format!("{:.1} MB/s", speed_mb)
+                            } else {
+                                let speed_kb = (delta as f64) / 1024.0;
+                                format!("{:.0} KB/s", speed_kb)
+                            };
+                            status.percent = ((cur_len % (50 * 1024 * 1024)) as f32
+                                / (50.0 * 1024.0 * 1024.0)
+                                * 100.0)
+                                .clamp(10.0, 95.0);
+                            self.active_download = true;
+                            let changed = status != self.last_emitted;
+                            if changed {
+                                self.last_emitted = status.clone();
+                            }
+                            return (changed, status);
+                        }
                     }
                 }
             }
         }
-    }
 
-    *last_size = 0;
-    status
+        self.last_size = 0;
+        self.active_download = false;
+        let changed = status != self.last_emitted;
+        if changed {
+            self.last_emitted = status.clone();
+        }
+        (changed, status)
+    }
 }
 
 #[tauri::command]
@@ -418,6 +691,9 @@ fn toggle_pin(app: AppHandle, pinned: bool) -> Result<(), String> {
 #[tauri::command]
 fn set_window_visible(app: AppHandle, visible: bool) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("main") {
+        if window.is_visible().unwrap_or(!visible) == visible {
+            return Ok(());
+        }
         if visible {
             let _ = window.show();
         } else {
@@ -578,15 +854,17 @@ fn write_clipboard(text: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn seek_media(position_secs: f64) -> Result<(), String> {
-    use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager;
-    if let Ok(manager_op) = GlobalSystemMediaTransportControlsSessionManager::RequestAsync() {
-        if let Ok(manager) = manager_op.await {
-            if let Ok(session) = manager.GetCurrentSession() {
-                let ticks = (position_secs * 10_000_000.0) as i64;
-                let _ = session.TryChangePlaybackPositionAsync(ticks);
-            }
-        }
+fn seek_media(state: tauri::State<'_, AppState>, position_secs: f64) -> Result<(), String> {
+    let target = if position_secs.is_finite() {
+        position_secs.max(0.0)
+    } else {
+        0.0
+    };
+    let (lock, cvar) = &*state.media_signal;
+    if let Ok(mut flags) = lock.lock() {
+        flags.pending_seek = Some(target);
+        flags.playback_changed = true;
+        cvar.notify_one();
     }
     Ok(())
 }
@@ -1088,22 +1366,11 @@ async fn check_os_notification_access() -> OsNotificationStatus {
 
 #[tauri::command]
 async fn get_recent_os_notifications() -> Result<Vec<OsNotificationItem>, String> {
-    use windows::UI::Notifications::Management::{
-        UserNotificationListener, UserNotificationListenerAccessStatus,
-    };
+    use windows::UI::Notifications::Management::UserNotificationListener;
     use windows::UI::Notifications::{KnownNotificationBindings, NotificationKinds};
 
     let listener = UserNotificationListener::Current()
         .map_err(|e| format!("UserNotificationListener error: {:?}", e))?;
-    let status = listener
-        .RequestAccessAsync()
-        .map_err(|e| format!("RequestAccessAsync error: {:?}", e))?
-        .await
-        .map_err(|e| format!("RequestAccessAsync await error: {:?}", e))?;
-
-    if status != UserNotificationListenerAccessStatus::Allowed {
-        return Err("needs_identity".into());
-    }
 
     let list = listener
         .GetNotificationsAsync(NotificationKinds::Toast)
@@ -1254,6 +1521,10 @@ pub fn run() {
         is_completed: false,
     };
 
+    let media_signal: SharedMediaSignal =
+        std::sync::Arc::new((Mutex::new(MediaDirtyFlags::default()), std::sync::Condvar::new()));
+    let worker_signal = media_signal.clone();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(agent_bridge::AgentBridgeState::new())
@@ -1264,6 +1535,8 @@ pub fn run() {
             ),
             cached_cpu: Mutex::new(0.0),
             media: Mutex::new(initial_media),
+            media_updated_at: Mutex::new(std::time::Instant::now()),
+            media_signal,
             download: Mutex::new(initial_download),
             is_expanded: AtomicBool::new(false),
             last_clip_seq: AtomicU32::new(0),
@@ -1372,34 +1645,340 @@ pub fn run() {
                 }
             }
 
-            // Background worker for downloads & GSMTC media (adapts sleep based on expanded state)
+            // Event-driven GSMTC media worker + mtime-guarded Downloads scanner (zero COM leaks)
             let app_handle = app.handle().clone();
             std::thread::spawn(move || {
-                let mut last_dl_size = 0u64;
-                let rt = tokio::runtime::Builder::new_current_thread().build();
+                use std::time::{Duration, Instant};
+                use windows::Foundation::TypedEventHandler;
+                use windows::Media::Control::{
+                    CurrentSessionChangedEventArgs, GlobalSystemMediaTransportControlsSessionManager,
+                    GlobalSystemMediaTransportControlsSessionPlaybackStatus,
+                };
+
+                let _com = ComMtaGuard::init();
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread().build() else {
+                    return;
+                };
+
+                let downloads_dir = std::env::var("USERPROFILE")
+                    .ok()
+                    .map(|p| std::path::PathBuf::from(p).join("Downloads"));
+                let mut dl_scanner = DownloadsScanner::new(downloads_dir);
+                let mut last_dl_scan = Instant::now() - Duration::from_secs(10);
+
+                let signal = worker_signal;
+
+                let mut manager_opt: Option<(
+                    GlobalSystemMediaTransportControlsSessionManager,
+                    i64,
+                )> = None;
+                let mut last_mgr_attempt = Instant::now() - Duration::from_secs(10);
+                let mut sub_session: Option<SubscribedSession> = None;
+                let mut cache = MediaCache::new();
 
                 loop {
-                    let expanded = app_handle
-                        .try_state::<AppState>()
-                        .map(|s| s.is_expanded.load(Ordering::Relaxed))
-                        .unwrap_or(false);
-
-                    let dl = scan_downloads_folder(&mut last_dl_size);
-                    if let Some(state) = app_handle.try_state::<AppState>() {
-                        *state.download.lock().unwrap() = dl;
-                    }
-
-                    if let Ok(ref rt) = rt {
-                        let info_res = rt.block_on(async { get_gsmtc_media().await });
-                        if let Ok(info) = info_res {
-                            if let Some(state) = app_handle.try_state::<AppState>() {
-                                *state.media.lock().unwrap() = info;
+                    // 1. Acquire SessionManager once (retry at most every 5s if failed or RPC disconnected)
+                    if manager_opt.is_none() && last_mgr_attempt.elapsed() >= Duration::from_secs(5)
+                    {
+                        last_mgr_attempt = Instant::now();
+                        let mgr_res = rt.block_on(async {
+                            GlobalSystemMediaTransportControlsSessionManager::RequestAsync()?
+                                .await
+                        });
+                        if let Ok(mgr) = mgr_res {
+                            let sig = signal.clone();
+                            let token = mgr
+                                .CurrentSessionChanged(&TypedEventHandler::<
+                                    GlobalSystemMediaTransportControlsSessionManager,
+                                    CurrentSessionChangedEventArgs,
+                                >::new(move |_, _| {
+                                    let (lock, cvar) = &*sig;
+                                    if let Ok(mut flags) = lock.lock() {
+                                        flags.session_changed = true;
+                                        cvar.notify_one();
+                                    }
+                                    Ok(())
+                                }))
+                                .unwrap_or(0);
+                            manager_opt = Some((mgr, token));
+                            if let Ok(mut flags) = signal.0.lock() {
+                                flags.session_changed = true;
                             }
                         }
                     }
 
-                    let sleep_ms = if expanded { 1100 } else { 2200 };
-                    std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+                    // 2. Drain dirty flags
+                    let (need_session, mut need_props, mut need_playback, pending_seek) = {
+                        let mut flags = signal.0.lock().unwrap_or_else(|e| e.into_inner());
+                        let res = (
+                            flags.session_changed,
+                            flags.props_changed,
+                            flags.playback_changed,
+                            flags.pending_seek.take(),
+                        );
+                        flags.session_changed = false;
+                        flags.props_changed = false;
+                        flags.playback_changed = false;
+                        res
+                    };
+
+                    if sub_session.is_some()
+                        && cache.last_fallback_check.elapsed() >= Duration::from_secs(30)
+                    {
+                        cache.last_fallback_check = Instant::now();
+                        need_props = true;
+                        need_playback = true;
+                    }
+
+                    // 3. Rebind current session when CurrentSessionChanged fires
+                    if need_session {
+                        sub_session = None;
+                        if let Some((ref mgr, mgr_token)) = manager_opt {
+                            match mgr.GetCurrentSession() {
+                                Ok(sess) => {
+                                    sub_session =
+                                        Some(SubscribedSession::subscribe(sess, &signal));
+                                    need_props = true;
+                                    need_playback = true;
+                                }
+                                Err(e) if is_rpc_disconnected(&e) => {
+                                    if mgr_token != 0 {
+                                        let _ = mgr.RemoveCurrentSessionChanged(mgr_token);
+                                    }
+                                    manager_opt = None;
+                                }
+                                Err(_) => {
+                                    // No active media session (null COM pointer) — keep manager cached!
+                                    cache.track_key = None;
+                                    let cover_changed = cache.cover_url.take().is_some()
+                                        || cache.last_emitted.cover_url.is_some();
+                                    let empty = empty_media_info();
+                                    if cache.last_emitted.is_available {
+                                        cache.last_emitted = empty.clone();
+                                        cache.last_emitted_at = Instant::now();
+                                        if let Some(state) = app_handle.try_state::<AppState>() {
+                                            *state.media.lock().unwrap_or_else(|e| e.into_inner()) =
+                                                empty.clone();
+                                            *state
+                                                .media_updated_at
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner()) =
+                                                Instant::now();
+                                        }
+                                        let _ = app_handle.emit(
+                                            "media-updated",
+                                            MediaEventPayload {
+                                                is_available: false,
+                                                is_playing: false,
+                                                title: String::new(),
+                                                artist: String::new(),
+                                                album: String::new(),
+                                                source: String::new(),
+                                                cover_changed,
+                                                cover_url: None,
+                                                position_secs: 0.0,
+                                                duration_secs: 0.0,
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 4. Execute pending seek on cached MTA session before reading timeline
+                    if let (Some(target_secs), Some(sub)) = (pending_seek, &sub_session) {
+                        let ticks = (target_secs * 10_000_000.0) as i64;
+                        let _ = rt.block_on(async {
+                            sub.session.TryChangePlaybackPositionAsync(ticks)?.await
+                        });
+                        need_playback = true;
+                    }
+
+                    // 5. Refresh active session metadata / playback only when dirty
+                    if (need_props || need_playback) && sub_session.is_some() {
+                        let sess = &sub_session.as_ref().unwrap().session;
+                        let mut cover_changed = false;
+                        let mut rpc_lost = false;
+
+                        if need_props || cache.track_key.is_none() {
+                            cache.last_fallback_check = Instant::now();
+                            let source = sess
+                                .SourceAppUserModelId()
+                                .map(|s| s.to_string())
+                                .unwrap_or_default();
+                            let props_res = rt
+                                .block_on(async { sess.TryGetMediaPropertiesAsync()?.await });
+                            match props_res {
+                                Ok(props) => {
+                                    let title =
+                                        props.Title().map(|s| s.to_string()).unwrap_or_default();
+                                    let artist =
+                                        props.Artist().map(|s| s.to_string()).unwrap_or_default();
+                                    let album = props
+                                        .AlbumTitle()
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_default();
+                                    let new_key = TrackKey {
+                                        source,
+                                        title,
+                                        artist,
+                                        album,
+                                    };
+                                    if cache.track_key.as_ref() != Some(&new_key) {
+                                        cache.cover_url = if new_key.title.is_empty() {
+                                            None
+                                        } else {
+                                            rt.block_on(extract_thumbnail_base64(&props))
+                                        };
+                                        cache.track_key = Some(new_key);
+                                        cover_changed = true;
+                                    }
+                                }
+                                Err(e) if is_rpc_disconnected(&e) => {
+                                    rpc_lost = true;
+                                }
+                                Err(_) => {}
+                            }
+                        }
+
+                        if !rpc_lost {
+                            let is_playing = match sess.GetPlaybackInfo() {
+                                Ok(pb) => pb
+                                    .PlaybackStatus()
+                                    .map(|st| {
+                                        st == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing
+                                    })
+                                    .unwrap_or(false),
+                                Err(e) if is_rpc_disconnected(&e) => {
+                                    rpc_lost = true;
+                                    false
+                                }
+                                Err(_) => false,
+                            };
+
+                            if !rpc_lost {
+                                let (position_secs, duration_secs) =
+                                    read_timeline(sess, is_playing);
+                                let key = cache.track_key.as_ref();
+                                let title = key.map(|k| k.title.clone()).unwrap_or_default();
+                                let artist = key.map(|k| k.artist.clone()).unwrap_or_default();
+                                let album = key.map(|k| k.album.clone()).unwrap_or_default();
+                                let source = key.map(|k| k.source.clone()).unwrap_or_default();
+
+                                let next_snapshot = MediaInfo {
+                                    is_available: !title.is_empty(),
+                                    is_playing,
+                                    title: title.clone(),
+                                    artist: artist.clone(),
+                                    album: album.clone(),
+                                    source: source.clone(),
+                                    cover_url: None,
+                                    position_secs,
+                                    duration_secs,
+                                };
+
+                                if let Some(state) = app_handle.try_state::<AppState>() {
+                                    let mut guard =
+                                        state.media.lock().unwrap_or_else(|e| e.into_inner());
+                                    guard.is_available = next_snapshot.is_available;
+                                    guard.is_playing = next_snapshot.is_playing;
+                                    guard.title.clone_from(&next_snapshot.title);
+                                    guard.artist.clone_from(&next_snapshot.artist);
+                                    guard.album.clone_from(&next_snapshot.album);
+                                    guard.source.clone_from(&next_snapshot.source);
+                                    guard.position_secs = next_snapshot.position_secs;
+                                    guard.duration_secs = next_snapshot.duration_secs;
+                                    if cover_changed {
+                                        guard.cover_url.clone_from(&cache.cover_url);
+                                    }
+                                    *state
+                                        .media_updated_at
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner()) = Instant::now();
+                                }
+
+                                let elapsed = cache.last_emitted_at.elapsed().as_secs_f64();
+                                if cover_changed
+                                    || should_emit_media_update(
+                                        &cache.last_emitted,
+                                        &next_snapshot,
+                                        elapsed,
+                                    )
+                                {
+                                    cache.last_emitted = next_snapshot;
+                                    cache.last_emitted_at = Instant::now();
+                                    let _ = app_handle.emit(
+                                        "media-updated",
+                                        MediaEventPayload {
+                                            is_available: !title.is_empty(),
+                                            is_playing,
+                                            title,
+                                            artist,
+                                            album,
+                                            source,
+                                            cover_changed,
+                                            cover_url: if cover_changed {
+                                                cache.cover_url.clone()
+                                            } else {
+                                                None
+                                            },
+                                            position_secs,
+                                            duration_secs,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+
+                        if rpc_lost {
+                            sub_session = None;
+                            if let Some((mgr, mgr_token)) = manager_opt.take() {
+                                if mgr_token != 0 {
+                                    let _ = mgr.RemoveCurrentSessionChanged(mgr_token);
+                                }
+                            }
+                        }
+                    }
+
+                    // 6. Throttled mtime-guarded Downloads scan
+                    let dl_interval = if dl_scanner.active_download {
+                        Duration::from_millis(2000)
+                    } else {
+                        Duration::from_millis(4000)
+                    };
+                    if last_dl_scan.elapsed() >= dl_interval {
+                        last_dl_scan = Instant::now();
+                        let (dl_changed, dl) = dl_scanner.scan_if_needed();
+                        if dl_changed {
+                            if let Some(state) = app_handle.try_state::<AppState>() {
+                                *state.download.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    dl.clone();
+                            }
+                            let _ = app_handle.emit("download-updated", dl);
+                        }
+                    }
+
+                    // 7. Sleep on condvar — wakes instantly on WinRT media events
+                    let expanded = app_handle
+                        .try_state::<AppState>()
+                        .map(|s| s.is_expanded.load(Ordering::Relaxed))
+                        .unwrap_or(false);
+                    let wait_dur = if dl_scanner.active_download {
+                        Duration::from_millis(2000)
+                    } else if expanded || cache.last_emitted.is_playing {
+                        Duration::from_millis(4000)
+                    } else {
+                        Duration::from_millis(5000)
+                    };
+                    let guard = signal.0.lock().unwrap_or_else(|e| e.into_inner());
+                    if !guard.session_changed
+                        && !guard.props_changed
+                        && !guard.playback_changed
+                        && guard.pending_seek.is_none()
+                    {
+                        let _ = signal.1.wait_timeout(guard, wait_dur);
+                    }
                 }
             });
 
@@ -1415,41 +1994,83 @@ pub fn run() {
             ocr::spawn_ocr_hotkey_listener(app.handle().clone());
             agent_bridge::spawn_agent_bridge_server(app.handle().clone());
 
-            // Precision click-through around the compact pill + Alt-key ghost mode
+            // Precision click-through around the compact pill + Alt-key ghost mode (adaptive polling)
             let ct_handle = app.handle().clone();
             std::thread::spawn(move || {
+                let mut cached_window = ct_handle.get_webview_window("main");
                 let mut last_ignore = false;
                 let mut last_ghost = false;
+                let mut last_pt: Option<(i32, i32)> = None;
+                let mut last_bounds = (0, 0, 0, 0);
+                let mut last_expanded = false;
+                let mut next_sleep_ms = 120u64;
+
                 loop {
-                    std::thread::sleep(std::time::Duration::from_millis(75));
-                    let Some(window) = ct_handle.get_webview_window("main") else {
+                    std::thread::sleep(std::time::Duration::from_millis(next_sleep_ms));
+                    if cached_window.is_none() {
+                        cached_window = ct_handle.get_webview_window("main");
+                    }
+                    let Some(ref window) = cached_window else {
+                        next_sleep_ms = 500;
                         continue;
                     };
                     if !window.is_visible().unwrap_or(false) {
+                        next_sleep_ms = 500;
                         continue;
                     }
-                    let expanded = ct_handle
+                    let (expanded, bounds) = ct_handle
                         .try_state::<AppState>()
-                        .map(|s| s.is_expanded.load(Ordering::Relaxed))
-                        .unwrap_or(false);
+                        .map(|s| {
+                            (
+                                s.is_expanded.load(Ordering::Relaxed),
+                                *s.pill_bounds.lock().unwrap_or_else(|e| e.into_inner()),
+                            )
+                        })
+                        .unwrap_or((false, (0, 0, 0, 0)));
 
                     let alt_down = unsafe { GetAsyncKeyState(VK_MENU.0 as i32) } < 0;
-                    if alt_down != last_ghost {
+                    let ghost_changed = alt_down != last_ghost;
+                    if ghost_changed {
                         last_ghost = alt_down;
                         let _ = ct_handle.emit("island-ghost", alt_down);
                     }
 
+                    let mut pt = POINT::default();
+                    let cur_pt = if unsafe { GetCursorPos(&mut pt) }.is_ok() {
+                        Some((pt.x, pt.y))
+                    } else {
+                        None
+                    };
+
+                    next_sleep_ms = if expanded && !alt_down {
+                        150
+                    } else if let Some((_, py)) = cur_pt {
+                        if bounds.2 > bounds.0 && bounds.3 > bounds.1 && py > bounds.3 + 80 {
+                            200
+                        } else {
+                            80
+                        }
+                    } else {
+                        120
+                    };
+
+                    if !ghost_changed
+                        && expanded == last_expanded
+                        && bounds == last_bounds
+                        && cur_pt == last_pt
+                    {
+                        continue;
+                    }
+                    last_expanded = expanded;
+                    last_bounds = bounds;
+                    last_pt = cur_pt;
+
                     let should_ignore = if alt_down {
                         true
                     } else if !expanded {
-                        let bounds = ct_handle
-                            .try_state::<AppState>()
-                            .map(|s| *s.pill_bounds.lock().unwrap())
-                            .unwrap_or((0, 0, 0, 0));
                         if bounds.2 > bounds.0 && bounds.3 > bounds.1 {
-                            let mut pt = POINT::default();
-                            if unsafe { GetCursorPos(&mut pt) }.is_ok() {
-                                pt.x < bounds.0 || pt.x > bounds.2 || pt.y < bounds.1 || pt.y > bounds.3
+                            if let Some((px, py)) = cur_pt {
+                                px < bounds.0 || px > bounds.2 || py < bounds.1 || py > bounds.3
                             } else {
                                 false
                             }
@@ -1489,5 +2110,78 @@ mod tests {
     #[test]
     fn fullscreen_check_returns_bool() {
         let _ = is_fullscreen_app_active();
+    }
+
+    #[test]
+    fn media_update_diff_skips_unchanged_and_detects_seek() {
+        let base = MediaInfo {
+            is_available: true,
+            is_playing: true,
+            title: "Cold".into(),
+            artist: "Dean Lewis".into(),
+            album: "".into(),
+            source: "Spotify.exe".into(),
+            cover_url: None,
+            position_secs: 10.0,
+            duration_secs: 200.0,
+        };
+        let tick = MediaInfo {
+            position_secs: 11.0,
+            ..base.clone()
+        };
+        assert!(!should_emit_media_update(&base, &tick, 1.0));
+
+        let seeked = MediaInfo {
+            position_secs: 45.0,
+            ..base.clone()
+        };
+        assert!(should_emit_media_update(&base, &seeked, 1.0));
+
+        let paused = MediaInfo {
+            is_playing: false,
+            ..base.clone()
+        };
+        assert!(should_emit_media_update(&base, &paused, 0.2));
+    }
+
+    #[test]
+    fn downloads_scanner_skips_unchanged_mtime() {
+        let dir = std::env::temp_dir().join(format!("apex_dl_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut scanner = DownloadsScanner::new(Some(dir.clone()));
+
+        let (changed1, status1) = scanner.scan_if_needed();
+        assert!(!changed1);
+        assert!(!status1.is_downloading);
+
+        let (changed2, _) = scanner.scan_if_needed();
+        assert!(!changed2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extrapolate_media_position_clamps_playing_and_skips_paused() {
+        let mut playing = MediaInfo {
+            is_available: true,
+            is_playing: true,
+            title: "Cold".into(),
+            artist: "Dean Lewis".into(),
+            album: "".into(),
+            source: "Spotify.exe".into(),
+            cover_url: None,
+            position_secs: 195.0,
+            duration_secs: 200.0,
+        };
+        extrapolate_media_position(&mut playing, 10.0);
+        assert_eq!(playing.position_secs, 200.0);
+
+        let mut paused = MediaInfo {
+            is_playing: false,
+            position_secs: 50.0,
+            ..playing
+        };
+        extrapolate_media_position(&mut paused, 10.0);
+        assert_eq!(paused.position_secs, 50.0);
     }
 }

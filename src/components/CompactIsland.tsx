@@ -121,7 +121,6 @@ export const CompactIsland: React.FC<CompactIslandProps> = ({
                 borderRadius: '50%',
                 objectFit: 'cover',
                 border: '1px solid rgba(255, 255, 255, 0.2)',
-                animation: isPlaying ? 'spin 5s linear infinite' : 'none',
               }}
             />
           ) : (
@@ -129,7 +128,6 @@ export const CompactIsland: React.FC<CompactIslandProps> = ({
               size={18}
               style={{
                 color: '#34d399',
-                animation: isPlaying ? 'spin 4s linear infinite' : 'none',
               }}
             />
           )
@@ -146,7 +144,6 @@ export const CompactIsland: React.FC<CompactIslandProps> = ({
                 ? '0 0 12px rgba(6, 182, 212, 0.8), 0 0 4px #8b5cf6'
                 : '0 0 8px rgba(6, 182, 212, 0.5)',
               position: 'relative',
-              animation: 'pulse 2.5s infinite ease-in-out',
             }}
           />
         ) : isPerchedCatActive ? (

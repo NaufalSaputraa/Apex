@@ -51,9 +51,11 @@ export const TodayView: React.FC = () => {
   const [nowDate, setNowDate] = useState<Date>(() => new Date());
 
   useEffect(() => {
+    if (subTab !== 'prayer') return;
+    setNowDate(new Date());
     const t = setInterval(() => setNowDate(new Date()), 1000);
     return () => clearInterval(t);
-  }, []);
+  }, [subTab]);
 
   const [icalUrl, setIcalUrl] = useState<string>(() => localStorage.getItem('apex_ical_url') || '');
   const [showIcalInput, setShowIcalInput] = useState<boolean>(false);

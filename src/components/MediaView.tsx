@@ -50,7 +50,7 @@ export const MediaView: React.FC<MediaViewProps> = ({
       }
     };
     syncVolume();
-    const timer = setInterval(syncVolume, 1200);
+    const timer = setInterval(syncVolume, 2000);
     return () => clearInterval(timer);
   }, []);
 

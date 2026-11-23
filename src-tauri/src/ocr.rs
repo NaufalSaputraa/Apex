@@ -89,6 +89,9 @@ pub async fn run_screen_ocr(x: i32, y: i32, width: i32, height: i32) -> Result<S
         )
         .map_err(|e| e.to_string())?;
 
+        let _ = writer.Close();
+        let _ = stream.Close();
+
         let engine = OcrEngine::TryCreateFromUserProfileLanguages()
             .map_err(|_| "Tidak ada bahasa OCR Windows terpasang (tambahkan di Windows Settings)".to_string())?;
 
